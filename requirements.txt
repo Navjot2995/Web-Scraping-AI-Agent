@@ -1,0 +1,10 @@
+streamlit
+beautifulsoup4
+selenium
+scrapy
+langchain
+langchain-openai
+pandas
+python-dotenv
+webdriver-manager
+pip
