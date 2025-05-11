@@ -8,3 +8,4 @@ pandas
 python-dotenv
 webdriver-manager
 pip
+langchain_community
