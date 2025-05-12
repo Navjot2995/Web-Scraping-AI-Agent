@@ -3,7 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from langchain_community.chat_models import ChatOpenAI  # Updated import
+from langchain_community.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 import pandas as pd
 import json
@@ -17,13 +17,42 @@ import os
 llm = ChatOpenAI(temperature=0.7, model="gpt-4")
 
 def get_page_content(url):
-    """Basic content fetcher with error handling"""
+    """Improved content fetcher with headers and Selenium fallback"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Referer': 'https://www.google.com/',
+    }
+    
     try:
-        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         return response.text
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            st.warning("Requests blocked, falling back to Selenium...")
+            return selenium_fetch(url)
+        return f"Error: {str(e)}"
     except Exception as e:
         return f"Error: {str(e)}"
+
+def selenium_fetch(url):
+    """Headless browser fetch for JS-heavy or protected sites"""
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+    
+    try:
+        driver = webdriver.Chrome(options=options)
+        driver.get(url)
+        driver.implicitly_wait(5)
+        return driver.page_source
+    except Exception as e:
+        return f"Selenium Error: {str(e)}"
+    finally:
+        if 'driver' in locals():
+            driver.quit()
 
 def generate_ai_questions(content):
     """AI-powered question suggestion generator"""
@@ -35,15 +64,16 @@ def generate_ai_questions(content):
         "\n\n{content}\n\nFormat as numbered list."
     )
     chain = prompt | llm
-    return chain.invoke({"content": content[:3000]}).content  # Truncate for token limits
+    return chain.invoke({"content": content[:3000]}).content
 
 def bs4_scraper(url):
     """BeautifulSoup-based scraper with structured data extraction"""
+    content = get_page_content(url)
+    
+    if content.startswith("Error:") or content.startswith("Selenium Error:"):
+        return {'error': content}
+    
     try:
-        content = get_page_content(url)
-        if isinstance(content, str) and content.startswith('Error'):
-            return {'error': content}
-        
         soup = BeautifulSoup(content, 'html.parser')
         
         # Get headers with their context
@@ -57,7 +87,7 @@ def bs4_scraper(url):
         
         return {
             'title': soup.title.string if soup.title else 'No title',
-            'headers': headers,  # Now a list of dicts with related links
+            'headers': headers,
             'all_links': [a['href'] for a in soup.find_all('a', href=True)],
             'text': soup.get_text(separator=' ', strip=True)[:1000] + '...'
         }
@@ -68,6 +98,7 @@ def selenium_scraper(url):
     """Selenium-based scraper for JavaScript sites"""
     options = Options()
     options.add_argument("--headless=new")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
     
     try:
         driver = webdriver.Chrome(options=options)
@@ -160,6 +191,8 @@ with col2:
     if 'scraping_result' in st.session_state:
         if 'error' in st.session_state.scraping_result:
             st.error(f"Scraping failed: {st.session_state.scraping_result['error']}")
+            if "403" in st.session_state.scraping_result['error']:
+                st.warning("Tip: Try using **Selenium** instead (some sites block automated requests).")
         else:
             st.subheader(f"Results using {tool}")
             
@@ -210,6 +243,6 @@ with st.expander("Tool Documentation"):
 # Usage tips
 st.info("""💡 Pro Tips: 
 - Start with BeautifulSoup for basic sites
-- Use Selenium for dynamic content
+- Use Selenium for dynamic content or if getting 403 errors
 - Choose Scrapy for large-scale projects
 - Check browser console for errors if scraping fails""")
