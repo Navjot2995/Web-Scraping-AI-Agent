@@ -3,7 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from langchain.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatOpenAI  # Updated import
 from langchain.prompts import ChatPromptTemplate
 import pandas as pd
 import json
@@ -14,18 +14,22 @@ import tempfile
 import os
 
 # Initialize AI model
-llm = ChatOpenAI(temperature=0.7, model="gpt-4o")
+llm = ChatOpenAI(temperature=0.7, model="gpt-4")
 
 def get_page_content(url):
     """Basic content fetcher with error handling"""
     try:
         response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
         return response.text
     except Exception as e:
-        return str(e)
+        return f"Error: {str(e)}"
 
 def generate_ai_questions(content):
     """AI-powered question suggestion generator"""
+    if content.startswith("Error:"):
+        return "Could not generate questions due to: " + content
+    
     prompt = ChatPromptTemplate.from_template(
         "Based on this webpage content, suggest 5 relevant scraping questions:"
         "\n\n{content}\n\nFormat as numbered list."
@@ -34,24 +38,39 @@ def generate_ai_questions(content):
     return chain.invoke({"content": content[:3000]}).content  # Truncate for token limits
 
 def bs4_scraper(url):
-    """BeautifulSoup-based scraper with data extraction"""
-    content = get_page_content(url)
-    soup = BeautifulSoup(content, 'html.parser')
-    
-    return {
-        'title': soup.title.string if soup.title else 'No title',
-        'headers': [h.text for h in soup.find_all(['h1', 'h2', 'h3'])],
-        'links': [a['href'] for a in soup.find_all('a', href=True)],
-        'text': soup.get_text(separator=' ', strip=True)[:1000] + '...'
-    }
+    """BeautifulSoup-based scraper with structured data extraction"""
+    try:
+        content = get_page_content(url)
+        if isinstance(content, str) and content.startswith('Error'):
+            return {'error': content}
+        
+        soup = BeautifulSoup(content, 'html.parser')
+        
+        # Get headers with their context
+        headers = []
+        for h in soup.find_all(['h1', 'h2', 'h3']):
+            headers.append({
+                'text': h.text.strip(),
+                'tag': h.name,
+                'links': [a['href'] for a in h.find_all_next('a', href=True, limit=3)]
+            })
+        
+        return {
+            'title': soup.title.string if soup.title else 'No title',
+            'headers': headers,  # Now a list of dicts with related links
+            'all_links': [a['href'] for a in soup.find_all('a', href=True)],
+            'text': soup.get_text(separator=' ', strip=True)[:1000] + '...'
+        }
+    except Exception as e:
+        return {'error': str(e)}
 
 def selenium_scraper(url):
     """Selenium-based scraper for JavaScript sites"""
     options = Options()
     options.add_argument("--headless=new")
-    driver = webdriver.Chrome(options=options)
     
     try:
+        driver = webdriver.Chrome(options=options)
         driver.get(url)
         driver.implicitly_wait(5)
         
@@ -60,8 +79,11 @@ def selenium_scraper(url):
             'text': driver.find_element("tag name", 'body').text[:1000] + '...',
             'scripts': len(driver.find_elements("tag name", 'script'))
         }
+    except Exception as e:
+        return {'error': str(e)}
     finally:
-        driver.quit()
+        if 'driver' in locals():
+            driver.quit()
 
 class CustomSpider(Spider):
     """Scrapy spider for advanced scraping"""
@@ -76,23 +98,26 @@ class CustomSpider(Spider):
 
 def scrapy_scraper(url):
     """Scrapy-based scraper with temp file handling"""
-    with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-        f.write(f"""
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            f.write(f"""
 import scrapy
 from scrapy.spiders import Spider
 
 class TempSpider(CustomSpider):
     start_urls = ['{url}']
 """)
-    
-    process = CrawlerProcess(get_project_settings())
-    process.crawl(TempSpider)
-    process.start()
-    
-    # Cleanup temporary file
-    os.unlink(f.name)
-    
-    return process.spider_loader.load('streamlit_spider').crawler.stats.get_stats()
+        
+        process = CrawlerProcess(get_project_settings())
+        process.crawl(TempSpider)
+        process.start()
+        
+        return process.spider_loader.load('streamlit_spider').crawler.stats.get_stats()
+    except Exception as e:
+        return {'error': str(e)}
+    finally:
+        if 'f' in locals() and os.path.exists(f.name):
+            os.unlink(f.name)
 
 # Streamlit UI
 st.set_page_config(page_title="AI Web Scraping Agent", layout="wide")
@@ -115,7 +140,7 @@ with col1:
             # Get basic content for AI suggestions
             content = get_page_content(url)
             
-            if ai_enabled and content:
+            if ai_enabled and content and not content.startswith("Error:"):
                 with st.expander("AI Suggested Questions"):
                     questions = generate_ai_questions(content)
                     st.write(questions)
@@ -133,27 +158,35 @@ with col1:
 with col2:
     st.header("Results")
     if 'scraping_result' in st.session_state:
-        st.subheader(f"Results using {tool}")
-        
-        if tool == "BeautifulSoup":
-            df = pd.DataFrame({
-                'Headers': st.session_state.scraping_result['headers'],
-                'Links': st.session_state.scraping_result['links']
-            })
-            st.dataframe(df)
+        if 'error' in st.session_state.scraping_result:
+            st.error(f"Scraping failed: {st.session_state.scraping_result['error']}")
+        else:
+            st.subheader(f"Results using {tool}")
             
-        elif tool == "Selenium":
-            st.json(st.session_state.scraping_result)
+            if tool == "BeautifulSoup":
+                st.subheader("Headers with Related Links")
+                for header in st.session_state.scraping_result['headers']:
+                    with st.expander(f"{header['tag'].upper()}: {header['text']}"):
+                        st.write("Related links:")
+                        for link in header['links']:
+                            st.write(link)
+                
+                st.subheader("All Links")
+                st.write(st.session_state.scraping_result['all_links'])
+                
+            elif tool == "Selenium":
+                st.json(st.session_state.scraping_result)
+                
+            elif tool == "Scrapy":
+                st.write(st.session_state.scraping_result)
             
-        elif tool == "Scrapy":
-            st.write(st.session_state.scraping_result)
-        
-        # Export options
-        st.download_button(
-            label="Download JSON Report",
-            data=json.dumps(st.session_state.scraping_result, indent=2),
-            file_name="scraping_report.json"
-        )
+            # Export options
+            st.download_button(
+                label="Download JSON Report",
+                data=json.dumps(st.session_state.scraping_result, indent=2),
+                file_name="scraping_report.json",
+                mime="application/json"
+            )
 
 # Tool-specific documentation
 with st.expander("Tool Documentation"):
@@ -175,4 +208,8 @@ with st.expander("Tool Documentation"):
     """)
 
 # Usage tips
-st.info("💡 Pro Tips: Start with BeautifulSoup for basic sites, use Selenium for dynamic content, and Scrapy for large-scale projects.")
+st.info("""💡 Pro Tips: 
+- Start with BeautifulSoup for basic sites
+- Use Selenium for dynamic content
+- Choose Scrapy for large-scale projects
+- Check browser console for errors if scraping fails""")
